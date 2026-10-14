@@ -18,7 +18,7 @@ func TestParseHTML(t *testing.T) {
 	</body>
 	</html>`
 
-	elems := parseHTML(strings.NewReader(htmlSample))
+	_, elems := parseHTML(strings.NewReader(htmlSample))
 	if len(elems) == 0 {
 		t.Fatalf("expected non-empty elements")
 	}
