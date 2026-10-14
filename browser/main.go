@@ -1,10 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"image"
 	"image/color"
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
 	"io"
 	"net/http"
 	"net/http/cookiejar"
@@ -18,6 +23,7 @@ import (
 	"gioui.org/app"
 	"gioui.org/layout"
 	"gioui.org/op"
+	"gioui.org/op/paint"
 	"gioui.org/unit"
 	"gioui.org/widget"
 	"gioui.org/widget/material"
@@ -32,6 +38,7 @@ const (
 	TypeLink
 	TypeForm
 	TypeError
+	TypeImage
 )
 
 type FormElement struct {
@@ -46,10 +53,17 @@ type PageElement struct {
 	Level    int // For headings 1-6
 	Text     string
 	Href     string
+	Src      string
 	IsBold   bool
 	IsBullet bool
 	Click    widget.Clickable
 	Form     *FormElement
+}
+
+type BookmarkItem struct {
+	Title string `json:"title"`
+	URL   string `json:"url"`
+	Click widget.Clickable `json:"-"`
 }
 
 type HistoryState struct {
@@ -65,6 +79,8 @@ type BrowserApp struct {
 	fwdBtn      widget.Clickable
 	reloadBtn   widget.Clickable
 	homeBtn     widget.Clickable
+	bookmarkBtn widget.Clickable
+	bookmarkBar widget.List
 	contentList widget.List
 
 	client *http.Client
@@ -78,6 +94,10 @@ type BrowserApp struct {
 	pageElements []*PageElement
 	loading      bool
 	cancelFetch  context.CancelFunc
+	imgCacheMu   sync.Mutex
+	imgCache     map[string]image.Image
+	window       *app.Window
+	bookmarks    []*BookmarkItem
 }
 
 const defaultHomeURL = "https://www.google.com"
@@ -115,6 +135,119 @@ func (b *BrowserApp) saveHistory() {
 	}
 }
 
+func bookmarksFilePath() string {
+	return filepath.Join(".", "bookmarks.json")
+}
+
+func (b *BrowserApp) loadBookmarks() {
+	data, err := os.ReadFile(bookmarksFilePath())
+	if err != nil {
+		b.bookmarks = []*BookmarkItem{
+			{Title: "Google", URL: "https://www.google.com"},
+		}
+		return
+	}
+	var bms []*BookmarkItem
+	if err := json.Unmarshal(data, &bms); err == nil && len(bms) > 0 {
+		b.bookmarks = bms
+	} else {
+		b.bookmarks = []*BookmarkItem{
+			{Title: "Google", URL: "https://www.google.com"},
+		}
+	}
+}
+
+func (b *BrowserApp) saveBookmarks() {
+	data, err := json.MarshalIndent(b.bookmarks, "", "  ")
+	if err == nil {
+		_ = os.WriteFile(bookmarksFilePath(), data, 0644)
+	}
+}
+
+func (b *BrowserApp) isCurrentBookmarked() bool {
+	for _, bm := range b.bookmarks {
+		if bm.URL == b.currentURL {
+			return true
+		}
+	}
+	return false
+}
+
+func (b *BrowserApp) toggleBookmark() {
+	if b.currentURL == "" {
+		return
+	}
+	for i, bm := range b.bookmarks {
+		if bm.URL == b.currentURL {
+			b.bookmarks = append(b.bookmarks[:i], b.bookmarks[i+1:]...)
+			b.saveBookmarks()
+			return
+		}
+	}
+	title := b.pageTitle
+	if title == "" {
+		title = b.currentURL
+	}
+	b.bookmarks = append(b.bookmarks, &BookmarkItem{
+		Title: title,
+		URL:   b.currentURL,
+	})
+	b.saveBookmarks()
+}
+
+func (b *BrowserApp) getImage(rawURL string) image.Image {
+	b.imgCacheMu.Lock()
+	defer b.imgCacheMu.Unlock()
+	return b.imgCache[rawURL]
+}
+
+func (b *BrowserApp) fetchImageAsync(rawURL string) {
+	b.imgCacheMu.Lock()
+	if _, exists := b.imgCache[rawURL]; exists {
+		b.imgCacheMu.Unlock()
+		return
+	}
+	b.imgCacheMu.Unlock()
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		req, err := http.NewRequestWithContext(ctx, "GET", rawURL, nil)
+		if err != nil {
+			return
+		}
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Kowser/1.0")
+
+		resp, err := b.client.Do(req)
+		if err != nil {
+			return
+		}
+		defer resp.Body.Close()
+
+		data, err := io.ReadAll(io.LimitReader(resp.Body, 5*1024*1024))
+		if err != nil {
+			return
+		}
+
+		img, _, err := image.Decode(bytes.NewReader(data))
+		if err != nil {
+			return
+		}
+
+		b.imgCacheMu.Lock()
+		b.imgCache[rawURL] = img
+		b.imgCacheMu.Unlock()
+
+		b.mu.Lock()
+		w := b.window
+		b.mu.Unlock()
+		if w != nil {
+			w.Invalidate()
+		}
+	}()
+}
+
 func main() {
 	jar, _ := cookiejar.New(nil)
 	b := &BrowserApp{
@@ -128,11 +261,18 @@ func main() {
 				Axis: layout.Vertical,
 			},
 		},
+		bookmarkBar: widget.List{
+			List: layout.List{
+				Axis: layout.Horizontal,
+			},
+		},
+		imgCache:   make(map[string]image.Image),
 		statusText: "Ready. Enter URL or search.",
 		pageTitle:  "Go Browser",
 	}
 
 	b.loadHistory()
+	b.loadBookmarks()
 
 	initialURL := defaultHomeURL
 	if b.historyIdx >= 0 && b.historyIdx < len(b.history) {
@@ -145,6 +285,9 @@ func main() {
 
 	go func() {
 		w := new(app.Window)
+		b.mu.Lock()
+		b.window = w
+		b.mu.Unlock()
 		w.Option(app.Title(b.pageTitle), app.Size(unit.Dp(900), unit.Dp(650)))
 		var ops op.Ops
 		for {
@@ -195,6 +338,24 @@ func (b *BrowserApp) handleEvents(gtx layout.Context, w *app.Window) {
 		b.urlEditor.SetText(defaultHomeURL)
 		go b.fetchURL(defaultHomeURL, true, w)
 		return
+	}
+	if b.bookmarkBtn.Clicked(gtx) {
+		b.mu.Lock()
+		b.toggleBookmark()
+		b.mu.Unlock()
+		w.Invalidate()
+		return
+	}
+
+	b.mu.Lock()
+	bms := b.bookmarks
+	b.mu.Unlock()
+	for _, bm := range bms {
+		if bm.Click.Clicked(gtx) {
+			b.urlEditor.SetText(bm.URL)
+			go b.fetchURL(bm.URL, true, w)
+			return
+		}
 	}
 
 	submit := false
@@ -328,6 +489,13 @@ func (b *BrowserApp) fetchURL(rawURL string, recordHistory bool, w *app.Window) 
 
 	title, elems := parseHTML(resp.Body)
 
+	for _, elem := range elems {
+		if elem.Type == TypeImage && elem.Src != "" {
+			elem.Src = resolveURL(resp.Request.URL.String(), elem.Src)
+			b.fetchImageAsync(elem.Src)
+		}
+	}
+
 	b.mu.Lock()
 	finalURL := resp.Request.URL.String()
 	b.currentURL = finalURL
@@ -396,6 +564,24 @@ func parseHTML(r io.Reader) (string, []*PageElement) {
 				title = strings.TrimSpace(nodeText(n))
 				return
 			case "script", "style", "noscript", "svg":
+				return
+			case "img":
+				src := ""
+				alt := ""
+				for _, attr := range n.Attr {
+					if attr.Key == "src" {
+						src = attr.Val
+					} else if attr.Key == "alt" {
+						alt = attr.Val
+					}
+				}
+				if src != "" {
+					elems = append(elems, &PageElement{
+						Type: TypeImage,
+						Src:  src,
+						Text: alt,
+					})
+				}
 				return
 			case "form":
 				action := ""
@@ -469,7 +655,7 @@ func parseHTML(r io.Reader) (string, []*PageElement) {
 			case "p", "div", "span":
 				hasBlockChild := false
 				for c := n.FirstChild; c != nil; c = c.NextSibling {
-					if c.Type == html.ElementNode && (c.Data == "p" || c.Data == "div" || c.Data == "h1" || c.Data == "h2" || c.Data == "h3" || c.Data == "a" || c.Data == "ul" || c.Data == "ol" || c.Data == "form" || c.Data == "li" || c.Data == "strong" || c.Data == "b") {
+					if c.Type == html.ElementNode && (c.Data == "p" || c.Data == "div" || c.Data == "h1" || c.Data == "h2" || c.Data == "h3" || c.Data == "a" || c.Data == "ul" || c.Data == "ol" || c.Data == "form" || c.Data == "li" || c.Data == "strong" || c.Data == "b" || c.Data == "img") {
 						hasBlockChild = true
 						break
 					}
@@ -520,6 +706,9 @@ func (b *BrowserApp) layout(gtx layout.Context) layout.Dimensions {
 			return b.layoutTopBar(gtx)
 		}),
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			return b.layoutBookmarkBar(gtx)
+		}),
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 			return b.layoutStatusBar(gtx)
 		}),
 		layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
@@ -558,6 +747,18 @@ func (b *BrowserApp) layoutTopBar(gtx layout.Context) layout.Dimensions {
 			}),
 			layout.Rigid(layout.Spacer{Width: unit.Dp(8)}.Layout),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				b.mu.Lock()
+				bookmarked := b.isCurrentBookmarked()
+				b.mu.Unlock()
+				label := "★"
+				if !bookmarked {
+					label = "☆"
+				}
+				btn := material.Button(b.theme, &b.bookmarkBtn, label)
+				return btn.Layout(gtx)
+			}),
+			layout.Rigid(layout.Spacer{Width: unit.Dp(8)}.Layout),
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				btnText := "Go"
 				if b.loading {
 					btnText = "..."
@@ -566,6 +767,32 @@ func (b *BrowserApp) layoutTopBar(gtx layout.Context) layout.Dimensions {
 				return btn.Layout(gtx)
 			}),
 		)
+	})
+}
+
+func (b *BrowserApp) layoutBookmarkBar(gtx layout.Context) layout.Dimensions {
+	b.mu.Lock()
+	bms := b.bookmarks
+	b.mu.Unlock()
+
+	if len(bms) == 0 {
+		return layout.Dimensions{}
+	}
+
+	inset := layout.Inset{Top: unit.Dp(4), Bottom: unit.Dp(4), Left: unit.Dp(8), Right: unit.Dp(8)}
+	return inset.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		return material.List(b.theme, &b.bookmarkBar).Layout(gtx, len(bms), func(gtx layout.Context, i int) layout.Dimensions {
+			bm := bms[i]
+			btnInset := layout.Inset{Right: unit.Dp(8)}
+			return btnInset.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+				btn := material.Clickable(gtx, &bm.Click, func(gtx layout.Context) layout.Dimensions {
+					lbl := material.Caption(b.theme, bm.Title)
+					lbl.Color = color.NRGBA{R: 100, G: 100, B: 100, A: 255}
+					return lbl.Layout(gtx)
+				})
+				return btn
+			})
+		})
 	})
 }
 
@@ -619,6 +846,32 @@ func (b *BrowserApp) layoutContent(gtx layout.Context) layout.Dimensions {
 			case TypeError:
 				lbl := material.Body1(b.theme, elem.Text)
 				lbl.Color = red
+				return lbl.Layout(gtx)
+			case TypeImage:
+				img := b.getImage(elem.Src)
+				if img != nil {
+					imgWidget := widget.Image{
+						Src:      paint.NewImageOp(img),
+						Fit:      widget.ScaleDown,
+						Position: layout.NW,
+					}
+					// Limit constraints for images
+					origConstraints := gtx.Constraints
+					gtx.Constraints.Max.Y = gtx.Dp(unit.Dp(240))
+					gtx.Constraints.Max.X = gtx.Dp(unit.Dp(360))
+					dims := imgWidget.Layout(gtx)
+					gtx.Constraints = origConstraints
+					return dims
+				}
+				// While loading or failed, show subtle placeholder/alt text
+				alt := elem.Text
+				if alt == "" {
+					alt = "[Image]"
+				} else {
+					alt = "[Image: " + alt + "]"
+				}
+				lbl := material.Caption(b.theme, alt)
+				lbl.Color = color.NRGBA{R: 128, G: 128, B: 128, A: 255}
 				return lbl.Layout(gtx)
 			case TypeHeading:
 				switch elem.Level {

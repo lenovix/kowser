@@ -12,6 +12,7 @@ func TestParseHTMLAdvanced(t *testing.T) {
 	<head><title>Test Page Title</title></head>
 	<body>
 		<h1>Main Title</h1>
+		<img src="/images/branding/googlelogo.png" alt="Google Logo" />
 		<form action="/search" method="GET">
 			<input name="q" />
 		</form>
@@ -27,9 +28,13 @@ func TestParseHTMLAdvanced(t *testing.T) {
 		t.Errorf("expected title 'Test Page Title', got %q", title)
 	}
 
-	var foundForm, foundHeading, foundBullet, foundBold bool
+	var foundForm, foundHeading, foundBullet, foundBold, foundImage bool
 	for _, e := range elems {
 		switch e.Type {
+		case TypeImage:
+			if e.Src == "/images/branding/googlelogo.png" && e.Text == "Google Logo" {
+				foundImage = true
+			}
 		case TypeForm:
 			foundForm = true
 		case TypeHeading:
@@ -46,6 +51,9 @@ func TestParseHTMLAdvanced(t *testing.T) {
 		}
 	}
 
+	if !foundImage {
+		t.Errorf("image element not parsed properly")
+	}
 	if !foundForm {
 		t.Errorf("form element not parsed")
 	}
@@ -57,5 +65,26 @@ func TestParseHTMLAdvanced(t *testing.T) {
 	}
 	if !foundBold {
 		t.Errorf("strong bold text not parsed")
+	}
+}
+
+func TestBookmarkToggle(t *testing.T) {
+	app := &BrowserApp{
+		currentURL: "https://news.ycombinator.com",
+		pageTitle:  "Hacker News",
+	}
+
+	if app.isCurrentBookmarked() {
+		t.Errorf("expected initially not bookmarked")
+	}
+
+	app.toggleBookmark()
+	if !app.isCurrentBookmarked() {
+		t.Errorf("expected bookmarked after toggle")
+	}
+
+	app.toggleBookmark()
+	if app.isCurrentBookmarked() {
+		t.Errorf("expected not bookmarked after second toggle")
 	}
 }
