@@ -11,11 +11,13 @@ import (
 	_ "image/jpeg"
 	_ "image/png"
 	"io"
+	"mime"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -41,6 +43,119 @@ const (
 	TypeImage
 )
 
+type StyleProps struct {
+	Color        *color.NRGBA
+	Background   *color.NRGBA
+	FontSizeSp   unit.Sp
+	HasFontSize  bool
+}
+
+var namedColors = map[string]color.NRGBA{
+	"black":   {0, 0, 0, 255},
+	"white":   {255, 255, 255, 255},
+	"red":     {255, 0, 0, 255},
+	"green":   {0, 128, 0, 255},
+	"blue":    {0, 0, 255, 255},
+	"yellow":  {255, 255, 0, 255},
+	"orange":  {255, 165, 0, 255},
+	"purple":  {128, 0, 128, 255},
+	"gray":    {128, 128, 128, 255},
+	"grey":    {128, 128, 128, 255},
+	"silver":  {192, 192, 192, 255},
+	"navy":    {0, 0, 128, 255},
+	"teal":    {0, 128, 128, 255},
+	"olive":   {128, 128, 0, 255},
+	"maroon":  {128, 0, 0, 255},
+	"lime":    {0, 255, 0, 255},
+	"aqua":    {0, 255, 255, 255},
+	"fuchsia": {255, 0, 255, 255},
+}
+
+func parseCSSColor(raw string) *color.NRGBA {
+	raw = strings.TrimSpace(strings.ToLower(raw))
+	if raw == "" {
+		return nil
+	}
+	if c, ok := namedColors[raw]; ok {
+		return &c
+	}
+	if strings.HasPrefix(raw, "#") {
+		hex := raw[1:]
+		switch len(hex) {
+		case 3:
+			r, e1 := strconv.ParseUint(string([]byte{hex[0], hex[0]}), 16, 8)
+			g, e2 := strconv.ParseUint(string([]byte{hex[1], hex[1]}), 16, 8)
+			b, e3 := strconv.ParseUint(string([]byte{hex[2], hex[2]}), 16, 8)
+			if e1 == nil && e2 == nil && e3 == nil {
+				return &color.NRGBA{R: uint8(r), G: uint8(g), B: uint8(b), A: 255}
+			}
+		case 6:
+			v, err := strconv.ParseUint(hex, 16, 32)
+			if err == nil {
+				return &color.NRGBA{R: uint8(v >> 16), G: uint8(v >> 8), B: uint8(v), A: 255}
+			}
+		}
+	}
+	return nil
+}
+
+func parseFontSize(raw string) (unit.Sp, bool) {
+	raw = strings.TrimSpace(strings.ToLower(raw))
+	switch raw {
+	case "x-small", "smaller":
+		return unit.Sp(11), true
+	case "small":
+		return unit.Sp(13), true
+	case "medium":
+		return unit.Sp(15), true
+	case "large":
+		return unit.Sp(19), true
+	case "x-large", "larger":
+		return unit.Sp(24), true
+	case "xx-large":
+		return unit.Sp(30), true
+	}
+	if strings.HasSuffix(raw, "px") {
+		if v, err := strconv.Atoi(strings.TrimSuffix(raw, "px")); err == nil && v > 0 {
+			return unit.Sp(v), true
+		}
+	}
+	return 0, false
+}
+
+func parseStyle(raw string) StyleProps {
+	var sp StyleProps
+	for _, decl := range strings.Split(raw, ";") {
+		parts := strings.SplitN(decl, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		prop := strings.TrimSpace(strings.ToLower(parts[0]))
+		val := strings.TrimSpace(parts[1])
+		switch prop {
+		case "color":
+			sp.Color = parseCSSColor(val)
+		case "background-color", "background":
+			sp.Background = parseCSSColor(val)
+		case "font-size":
+			if size, ok := parseFontSize(val); ok {
+				sp.FontSizeSp = size
+				sp.HasFontSize = true
+			}
+		}
+	}
+	return sp
+}
+
+func nodeStyleAttr(n *html.Node) StyleProps {
+	for _, attr := range n.Attr {
+		if attr.Key == "style" {
+			return parseStyle(attr.Val)
+		}
+	}
+	return StyleProps{}
+}
+
 type FormElement struct {
 	Action string
 	Method string
@@ -56,6 +171,7 @@ type PageElement struct {
 	Src      string
 	IsBold   bool
 	IsBullet bool
+	Style    StyleProps
 	Click    widget.Clickable
 	Form     *FormElement
 }
@@ -599,6 +715,14 @@ func (b *BrowserApp) fetchURL(tab *Tab, rawURL string, recordHistory bool, w *ap
 	}
 	defer resp.Body.Close()
 
+	// Check if this is a downloadable file (not HTML)
+	contentType := resp.Header.Get("Content-Type")
+	contentDisposition := resp.Header.Get("Content-Disposition")
+	if isDownloadableFile(contentType, contentDisposition) {
+		go b.downloadFile(tab, resp, rawURL, w)
+		return
+	}
+
 	title, elems := parseHTML(resp.Body)
 
 	for _, elem := range elems {
@@ -635,6 +759,94 @@ func (b *BrowserApp) fetchURL(tab *Tab, rawURL string, recordHistory bool, w *ap
 		w.Option(app.Title(title))
 		b.urlEditor.SetText(finalURL)
 	}
+	w.Invalidate()
+}
+
+func isDownloadableFile(contentType, contentDisposition string) bool {
+	if strings.Contains(strings.ToLower(contentDisposition), "attachment") {
+		return true
+	}
+	ct := strings.ToLower(contentType)
+	if strings.Contains(ct, "text/html") || strings.Contains(ct, "application/xhtml+xml") {
+		return false
+	}
+	// Common binary or non-HTML documents
+	if strings.Contains(ct, "application/pdf") ||
+		strings.Contains(ct, "application/zip") ||
+		strings.Contains(ct, "application/octet-stream") ||
+		strings.Contains(ct, "application/x-tar") ||
+		strings.Contains(ct, "application/gzip") ||
+		strings.Contains(ct, "application/json") ||
+		strings.Contains(ct, "audio/") ||
+		strings.Contains(ct, "video/") {
+		return true
+	}
+	return false
+}
+
+func extractFilename(resp *http.Response, rawURL string) string {
+	cd := resp.Header.Get("Content-Disposition")
+	if cd != "" {
+		if _, params, err := mime.ParseMediaType(cd); err == nil {
+			if fn, ok := params["filename"]; ok && fn != "" {
+				return filepath.Base(fn)
+			}
+		}
+	}
+	parsed, err := url.Parse(rawURL)
+	if err == nil {
+		base := filepath.Base(parsed.Path)
+		if base != "" && base != "." && base != "/" {
+			return base
+		}
+	}
+	return "downloaded_file"
+}
+
+func (b *BrowserApp) downloadFile(tab *Tab, resp *http.Response, rawURL string, w *app.Window) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		b.setErrorState(tab, "Failed to get User Home: "+err.Error(), rawURL, w)
+		return
+	}
+	downloadsDir := filepath.Join(home, "Downloads")
+	_ = os.MkdirAll(downloadsDir, 0755)
+
+	filename := extractFilename(resp, rawURL)
+	destPath := filepath.Join(downloadsDir, filename)
+
+	out, err := os.Create(destPath)
+	if err != nil {
+		b.setErrorState(tab, "Failed to create local file: "+err.Error(), rawURL, w)
+		return
+	}
+	defer out.Close()
+
+	b.mu.Lock()
+	tab.StatusText = "Downloading: " + filename + "..."
+	b.mu.Unlock()
+	w.Invalidate()
+
+	n, err := io.Copy(out, resp.Body)
+	b.mu.Lock()
+	tab.Loading = false
+	if err != nil {
+		tab.StatusText = "Download error: " + err.Error()
+	} else {
+		tab.StatusText = fmt.Sprintf("Downloaded %s (%d KB) to Downloads folder", filename, n/1024)
+		tab.PageElements = []*PageElement{
+			{
+				Type:  TypeHeading,
+				Level: 2,
+				Text:  "File Downloaded",
+			},
+			{
+				Type: TypeText,
+				Text: fmt.Sprintf("File saved successfully to: %s (%d KB)", destPath, n/1024),
+			},
+		}
+	}
+	b.mu.Unlock()
 	w.Invalidate()
 }
 
@@ -726,6 +938,7 @@ func parseHTML(r io.Reader) (string, []*PageElement) {
 						Type:  TypeHeading,
 						Level: level,
 						Text:  txt,
+						Style: nodeStyleAttr(n),
 					})
 				}
 				return
@@ -740,9 +953,10 @@ func parseHTML(r io.Reader) (string, []*PageElement) {
 				txt := strings.TrimSpace(nodeText(n))
 				if txt != "" && href != "" && !strings.HasPrefix(href, "javascript:") {
 					elems = append(elems, &PageElement{
-						Type: TypeLink,
-						Text: txt,
-						Href: href,
+						Type:  TypeLink,
+						Text:  txt,
+						Href:  href,
+						Style: nodeStyleAttr(n),
 					})
 				}
 				return
@@ -753,6 +967,7 @@ func parseHTML(r io.Reader) (string, []*PageElement) {
 						Type:     TypeText,
 						Text:     txt,
 						IsBullet: true,
+						Style:    nodeStyleAttr(n),
 					})
 				}
 				return
@@ -763,6 +978,7 @@ func parseHTML(r io.Reader) (string, []*PageElement) {
 						Type:   TypeText,
 						Text:   txt,
 						IsBold: true,
+						Style:  nodeStyleAttr(n),
 					})
 				}
 				return
@@ -778,8 +994,9 @@ func parseHTML(r io.Reader) (string, []*PageElement) {
 					txt := strings.TrimSpace(nodeText(n))
 					if txt != "" {
 						elems = append(elems, &PageElement{
-							Type: TypeText,
-							Text: txt,
+							Type:  TypeText,
+							Text:  txt,
+							Style: nodeStyleAttr(n),
 						})
 						return
 					}
@@ -1068,16 +1285,44 @@ func (b *BrowserApp) layoutContent(gtx layout.Context) layout.Dimensions {
 			case TypeHeading:
 				switch elem.Level {
 				case 1:
-					return material.H4(b.theme, elem.Text).Layout(gtx)
+					h := material.H4(b.theme, elem.Text)
+					if elem.Style.Color != nil {
+						h.Color = *elem.Style.Color
+					}
+					if elem.Style.HasFontSize {
+						h.TextSize = elem.Style.FontSizeSp
+					}
+					return h.Layout(gtx)
 				case 2:
-					return material.H5(b.theme, elem.Text).Layout(gtx)
+					h := material.H5(b.theme, elem.Text)
+					if elem.Style.Color != nil {
+						h.Color = *elem.Style.Color
+					}
+					if elem.Style.HasFontSize {
+						h.TextSize = elem.Style.FontSizeSp
+					}
+					return h.Layout(gtx)
 				default:
-					return material.H6(b.theme, elem.Text).Layout(gtx)
+					h := material.H6(b.theme, elem.Text)
+					if elem.Style.Color != nil {
+						h.Color = *elem.Style.Color
+					}
+					if elem.Style.HasFontSize {
+						h.TextSize = elem.Style.FontSizeSp
+					}
+					return h.Layout(gtx)
 				}
 			case TypeLink:
 				btn := material.Clickable(gtx, &elem.Click, func(gtx layout.Context) layout.Dimensions {
 					lbl := material.Body1(b.theme, elem.Text)
-					lbl.Color = blue
+					if elem.Style.Color != nil {
+						lbl.Color = *elem.Style.Color
+					} else {
+						lbl.Color = blue
+					}
+					if elem.Style.HasFontSize {
+						lbl.TextSize = elem.Style.FontSizeSp
+					}
 					return lbl.Layout(gtx)
 				})
 				return btn
@@ -1087,6 +1332,12 @@ func (b *BrowserApp) layoutContent(gtx layout.Context) layout.Dimensions {
 					txt = "• " + txt
 				}
 				lbl := material.Body1(b.theme, txt)
+				if elem.Style.Color != nil {
+					lbl.Color = *elem.Style.Color
+				}
+				if elem.Style.HasFontSize {
+					lbl.TextSize = elem.Style.FontSizeSp
+				}
 				return lbl.Layout(gtx)
 			}
 		})

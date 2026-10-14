@@ -76,10 +76,28 @@ Daftar fitur browser Kowser yang sudah di-develop dan yang masih dalam antrean (
 - Tombol tutup tab individual (`x`).
 - Perlindungan tab terakhir: jika tab terakhir ditutup, browser tidak crash melainkan otomatis me-reset tab menjadi "New Tab" ke `google.com`.
 
+### 14. File Download Handler (M11)
+- Deteksi tipe konten unduhan otomatis via `Content-Type` header biner (`application/pdf`, `zip`, `octet-stream`, `tar`, `gzip`, audio, video) dan header `Content-Disposition: attachment`.
+- Pengalihan otomatis dari pipeline HTML parser langsung ke stream writer biner lokal.
+- Deteksi nama berkas via parameter `filename` di Content-Disposition atau fallback ke path URL terakhir.
+- Penyimpanan berkas langsung ke direktori bawaan sistem `Downloads` pengguna (`os.UserHomeDir()/Downloads`).
+- Tampilan notifikasi status download dan halaman ringkasan download berhasil (dengan lokasi berkas dan ukuran byte).
+
+### 15. Inline CSS Styling Engine (M7)
+- Parser atribut HTML `style="..."` pada tag heading (`h1-h6`), link (`a`), bullet list (`li`), teks tebal (`b/strong`), dan paragraf (`p/div/span`).
+- Dukungan warna font `color`:
+  - Format kode heksadesimal (`#RRGGBB` dan `#RGB`).
+  - Named colors standar CSS (`red`, `green`, `blue`, `black`, `gray`, `orange`, `purple`, `yellow`, dll).
+- Dukungan ukuran font `font-size`:
+  - Unit pixel absolut (`12px`, `16px`, `24px`, dll).
+  - Skala tipografi semantik (`small`, `medium`, `large`, `x-large`, `xx-large`).
+- Dukungan properti `background-color` / `background`.
+- Render tipografi responsif Gio dengan injeksi `StyleProps` dinamis per-elemen pada layar.
+
 ---
 
 ## Roadmap Fitur Berikutnya (Sesuai `tasks.md`)
 
-- [ ] **M7: CSS Parser Dasar** (Parsing inline stylesheet dan atribut `style`, warna dan font custom).
-- [ ] **M11: File Download Handler** (Deteksi file non-HTML, simpan stream ke folder Downloads pengguna).
-- [ ] **M12: Zoom Controls & Text Resizing** (Zoom in/out skala tampilan konten halaman).
+- [ ] **M12: Zoom Controls & Text Resizing** (Zoom in/out skala tampilan konten seluruh viewport).
+- [ ] **M13: Find in Page (Ctrl+F)** (Pencarian kata kunci dalam konten halaman aktif dan highlight posisi).
+- [ ] **M14: Private / Incognito Tab Mode** (Mode penjelajahan tanpa penyimpanan cookies dan history).
