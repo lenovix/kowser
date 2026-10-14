@@ -94,10 +94,48 @@ Daftar fitur browser Kowser yang sudah di-develop dan yang masih dalam antrean (
 - Dukungan properti `background-color` / `background`.
 - Render tipografi responsif Gio dengan injeksi `StyleProps` dinamis per-elemen pada layar.
 
+### 16. DOM Tree Abstraction (E1)
+- Tree struktur DOM (*Node) dengan pointer parent/child/sibling.
+- Query engine untuk selector CSS sederhana: `#id`, `.class`, tag, dan `parent child` descendant.
+- Flattening DOM ke `PageElement` untuk view saat ini tanpa merusak shell UI browser.
+- Mendukung adapter parser dari `golang.org/x/net/html` sebagai input DOM sumber.
+- All unit tests lulus untuk tree traversal, querySelector, dan roundtrip parsing HTML ke DOM dan kembali.
+
+### 17. CSS Cascade & Style Computation Engine (E2)
+- **Parser CSS**: Membaca blok `<style>` (termasuk penghapusan komentar `/* */`), memecah rule selector `{ ... }`, dan parsing deklarasi `property: value`.
+- **Selector Matching Engine**: Mencocokkan selector `tag`, `.class`, `#id`, dan compound (`div.cls#id`) serta descendant combinator (`parent child`) terhadap node DOM.
+- **Specificity Calculation**: Perhitungan bobot selector `(ID, Class, Tag)` dan sorting stabil berdasarkan specificity lalu urutan dokumen.
+- **Cascade Resolution**: Penerapan berurutan dari specificity terendah ke tertinggi, dengan atribut inline `style="..."` sebagai override prioritas tertinggi.
+- **Inheritance**: Properti yang dapat diwariskan (`color`, `font-size`) diturunkan dari parent ke child secara rekursif.
+- **ComputedStyle**: Struktur nilai visual final per node: `Display`, `Color`, `BackgroundColor`, `FontSize`, `IsBold`, `IsItalic`, `Width`, `Height`, `Margin`, `Padding`.
+- **Default User-Agent Styles**: Style bawaan per tag (`h1`-`h6` bold + margin, `a` biru, `b/strong` bold, `em/i` italic, `span/a` inline).
+- **Integrasi Pipeline**: `ComputeStyles(domRoot)` dijalankan otomatis setelah parsing HTML; `flattenDOMToPageElements` menggunakan `n.Computed` sebagai sumber styling utama.
+
+### 18. Layout Box Engine (E3)
+- **Layout Tree Builder**: `BuildLayoutTree` mengonversi DOM tree menjadi box tree geometri, dengan dukungan `display: none` (dibuang dari tree) dan klasifikasi `Block` / `Inline`.
+- **CSS Box Model**: Perhitungan lengkap empat lapis box: `margin`, `padding`, `content (width/height)`, disertai helper geometri `ContentX/Y`, dan `PaddingBox`/`MarginBox`.
+- **Block Flow Layout**: Anak-anak block disusun vertikal, lebar blok otomatis mengisi lebar containing block (kecuali `width` eksplisit).
+- **Vertical Margin Collapsing**: Gap antar sibling block memakai `max(prevMarginBottom, nextMarginTop)` sesuai standar CSS.
+- **Inline Formatting Context & Word Wrapping**: Teks dipecah menjadi kata-kata dan dibungkus otomatis pada batas kata (`word boundary`) sesuai lebar container, menghasilkan `LineBox` per baris dengan `Y` dan `Height` yang akurat.
+- **Whitespace Handling**: Text node yang hanya berisi whitespace langsung di bawah elemen block tidak menghasilkan layout box (mencegah margin collapsing rusak dan gap palsu).
+- **Text Measurement**: Estimasi lebar karakter & tinggi baris proporsional terhadap `font-size` (dapat digantikan oleh font metrics Gio yang sesungguhnya pada E4).
+- **Integrasi Pipeline**: `BuildLayoutTree` + `ComputeLayout` dijalankan otomatis setelah CSS cascade; hasilnya disimpan sebagai `tab.LayoutRoot` untuk dikonsumsi oleh Paint Phase (E4).
+
+### 19. Paint Phase — Single-Pass Rendering Engine (E4)
+- **paint.go**: Modul pemerataan `PaintLayout` dan `PaintContext` untuk merender `LayoutBox` tree menjadi Gio paint ops dalam satu kali travers, mengikuti arsitektur "paint after layout" yang benar (tidak lagi flat-list).
+- **Painting Order**: Background padding box → uniform box border → text glyphs (via `material.Label`) → images (via `op/paint` GPU image ops) → link decorations, dalam urutan rekursif blok.
+- **Word-Line Rendering**: Setiap `LineBox` dilukis dengan `material.Label` per kata kecil dengan offset absolut dan pewarnaan link yang tepat (biru Google / computed style).
+- **Responsive Re-Layout**: `ComputeLayout(root, viewportWidth)` dijalankan ulang tiap `FrameEvent` di `layoutContent` berdasarkan batas viewport Gio (`gtx.Constraints.Max.X`), sehingga dokumen menyesuaikan lebar jendela secara dinamis.
+- **Scrollable Viewport**: Primitive scroll vertikal per-`Tab` (`ScrollY`, `MaxScrollY`); scroll position diterapkan sebagai offset global `absY - ScrollY` pada semua node paint.
+- **Link Hit-Testing & Routing**: `PaintContext.Links map[*Node]*widget.Clickable` dialokasi stabil per-`Tab`; hit rect dihitung dari geometri `LineBox`, dan klik terdeteksi via `Clickable.Clicked(gtx)` → ekstraksi `href` yang langsung di-resolve ke `fetchURL`.
+- **Image Pipeline Integration**: `<img>` diambil dan di-decode secara async, di-cache di `imgCache`, dan diskalakan secara GPU-accelerated di `PaintImageBox` dengan letterboxing proporsional.
+- **Fallback Path**: Status awal tanpa layout tree tetap memakai `material.List` legacy view untuk halaman error/loading, sehingga shell UI tetap kompatibel selama transisi.
+- **Tests**: `paint_test.go` — validasi emisi paint yang benar, alokasi clickable per link, dan perhitungan total height tanpa click palsu.
+
 ---
 
-## Roadmap Fitur Berikutnya (Sesuai `tasks.md`)
+## Roadmap Fitur Berikutnya
 
-- [ ] **M12: Zoom Controls & Text Resizing** (Zoom in/out skala tampilan konten seluruh viewport).
-- [ ] **M13: Find in Page (Ctrl+F)** (Pencarian kata kunci dalam konten halaman aktif dan highlight posisi).
-- [ ] **M14: Private / Incognito Tab Mode** (Mode penjelajahan tanpa penyimpanan cookies dan history).
+- [ ] **E5: JavaScript Engine** (Integrasi Goja, bridge DOM API) — ditunda sampai E1–E4 stabil.
+
+**Catatan penting**: Fondasi engine telah mencapai **E4 (Paint Phase — Single-Pass Rendering Engine)**. Dokumen statis sekarang benar-benar "paint after geometry": X/Y/Width/Height akurat di memori, word wrapping, margin collapsing, dan pewarnaan CSS cascade semua berakhir di single-pass paint ke GPU Gio. Tahap berikutnya adalah **E5 (JavaScript Engine / DOM Bindings)** yang merupakan lonjakan ambisius terbesar dan hanya akan dimulai setelah E1–E4 terbukti stabil di penggunaan nyata.

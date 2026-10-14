@@ -194,6 +194,11 @@ type Tab struct {
 	History      []string
 	HistoryIdx   int
 	PageElements []*PageElement
+	DOM          *Node
+	LayoutRoot   *LayoutBox
+	ScrollY      float32
+	MaxScrollY   float32
+	Links        map[*Node]*widget.Clickable
 	StatusText   string
 	Loading      bool
 	CancelFetch  context.CancelFunc
@@ -396,6 +401,7 @@ func (b *BrowserApp) newTab(initialURL string) *Tab {
 		CurrentURL: initialURL,
 		HistoryIdx: -1,
 		StatusText: "Ready.",
+		Links:      make(map[*Node]*widget.Clickable),
 		ContentList: widget.List{
 			List: layout.List{
 				Axis: layout.Vertical,
@@ -723,7 +729,24 @@ func (b *BrowserApp) fetchURL(tab *Tab, rawURL string, recordHistory bool, w *ap
 		return
 	}
 
-	title, elems := parseHTML(resp.Body)
+	domRoot, err := ParseHTMLToDOM(resp.Body)
+	if err != nil {
+		b.setErrorState(tab, "HTML parse error: "+err.Error(), rawURL, w)
+		return
+	}
+
+	// Compute CSS cascade styles across the entire DOM tree
+	ComputeStyles(domRoot)
+
+	// Compute Layout Box geometry tree (Box Model & Word Wrapping)
+	layoutRoot := BuildLayoutTree(domRoot)
+	ComputeLayout(layoutRoot, 850)
+
+	title := ""
+	if titleNode := domRoot.QuerySelector("title"); titleNode != nil {
+		title = strings.TrimSpace(titleNode.TextContent())
+	}
+	elems := flattenDOMToPageElements(domRoot, resp.Request.URL.String())
 
 	for _, elem := range elems {
 		if elem.Type == TypeImage && elem.Src != "" {
@@ -735,6 +758,8 @@ func (b *BrowserApp) fetchURL(tab *Tab, rawURL string, recordHistory bool, w *ap
 	b.mu.Lock()
 	finalURL := resp.Request.URL.String()
 	tab.CurrentURL = finalURL
+	tab.DOM = domRoot
+	tab.LayoutRoot = layoutRoot
 	tab.Loading = false
 	if title == "" {
 		title = finalURL
@@ -869,40 +894,56 @@ func (b *BrowserApp) setErrorState(tab *Tab, msg string, targetURL string, w *ap
 	w.Invalidate()
 }
 
+func getElementStyleProps(n *Node) StyleProps {
+	if n.Computed != nil {
+		return StyleProps{
+			Color:       &n.Computed.Color,
+			Background:  n.Computed.BackgroundColor,
+			FontSizeSp:  n.Computed.FontSize,
+			HasFontSize: true,
+		}
+	}
+	return parseStyle(n.Attribute("style"))
+}
+
 func parseHTML(r io.Reader) (string, []*PageElement) {
-	doc, err := html.Parse(r)
+	docRoot, err := ParseHTMLToDOM(r)
 	if err != nil {
 		return "", nil
 	}
+	ComputeStyles(docRoot)
+	title := ""
+	if titleNode := docRoot.QuerySelector("title"); titleNode != nil {
+		title = strings.TrimSpace(titleNode.TextContent())
+	}
+	return title, flattenDOMToPageElements(docRoot, "")
+}
 
-	var title string
+func flattenDOMToPageElements(root *Node, baseURL string) []*PageElement {
+	if root == nil {
+		return nil
+	}
+
 	var elems []*PageElement
 	const maxElements = 5000
 
-	var walk func(*html.Node)
-	walk = func(n *html.Node) {
+	var walk func(n *Node)
+	walk = func(n *Node) {
 		if len(elems) >= maxElements {
 			return
 		}
 
-		if n.Type == html.ElementNode {
-			switch n.Data {
-			case "title":
-				title = strings.TrimSpace(nodeText(n))
-				return
-			case "script", "style", "noscript", "svg":
+		if n.Type == NodeElement {
+			switch n.Tag {
+			case "title", "script", "style", "noscript", "svg":
 				return
 			case "img":
-				src := ""
-				alt := ""
-				for _, attr := range n.Attr {
-					if attr.Key == "src" {
-						src = attr.Val
-					} else if attr.Key == "alt" {
-						alt = attr.Val
-					}
-				}
+				src := n.Attribute("src")
+				alt := n.Attribute("alt")
 				if src != "" {
+					if baseURL != "" {
+						src = resolveURL(baseURL, src)
+					}
 					elems = append(elems, &PageElement{
 						Type: TypeImage,
 						Src:  src,
@@ -911,14 +952,10 @@ func parseHTML(r io.Reader) (string, []*PageElement) {
 				}
 				return
 			case "form":
-				action := ""
-				method := "GET"
-				for _, a := range n.Attr {
-					if a.Key == "action" {
-						action = a.Val
-					} else if a.Key == "method" {
-						method = strings.ToUpper(a.Val)
-					}
+				action := n.Attribute("action")
+				method := strings.ToUpper(n.Attribute("method"))
+				if method == "" {
+					method = "GET"
 				}
 				form := &FormElement{
 					Action: action,
@@ -931,72 +968,69 @@ func parseHTML(r io.Reader) (string, []*PageElement) {
 					Form: form,
 				})
 			case "h1", "h2", "h3", "h4", "h5", "h6":
-				level := int(n.Data[1] - '0')
-				txt := strings.TrimSpace(nodeText(n))
+				level := int(n.Tag[1] - '0')
+				txt := strings.TrimSpace(n.TextContent())
 				if txt != "" {
 					elems = append(elems, &PageElement{
 						Type:  TypeHeading,
 						Level: level,
 						Text:  txt,
-						Style: nodeStyleAttr(n),
+						Style: getElementStyleProps(n),
 					})
 				}
 				return
 			case "a":
-				href := ""
-				for _, attr := range n.Attr {
-					if attr.Key == "href" {
-						href = attr.Val
-						break
-					}
-				}
-				txt := strings.TrimSpace(nodeText(n))
+				href := n.Attribute("href")
+				txt := strings.TrimSpace(n.TextContent())
 				if txt != "" && href != "" && !strings.HasPrefix(href, "javascript:") {
+					if baseURL != "" {
+						href = resolveURL(baseURL, href)
+					}
 					elems = append(elems, &PageElement{
 						Type:  TypeLink,
 						Text:  txt,
 						Href:  href,
-						Style: nodeStyleAttr(n),
+						Style: getElementStyleProps(n),
 					})
 				}
 				return
 			case "li":
-				txt := strings.TrimSpace(nodeText(n))
+				txt := strings.TrimSpace(n.TextContent())
 				if txt != "" {
 					elems = append(elems, &PageElement{
 						Type:     TypeText,
 						Text:     txt,
 						IsBullet: true,
-						Style:    nodeStyleAttr(n),
+						Style:    getElementStyleProps(n),
 					})
 				}
 				return
 			case "strong", "b":
-				txt := strings.TrimSpace(nodeText(n))
+				txt := strings.TrimSpace(n.TextContent())
 				if txt != "" {
 					elems = append(elems, &PageElement{
 						Type:   TypeText,
 						Text:   txt,
 						IsBold: true,
-						Style:  nodeStyleAttr(n),
+						Style:  getElementStyleProps(n),
 					})
 				}
 				return
 			case "p", "div", "span":
 				hasBlockChild := false
 				for c := n.FirstChild; c != nil; c = c.NextSibling {
-					if c.Type == html.ElementNode && (c.Data == "p" || c.Data == "div" || c.Data == "h1" || c.Data == "h2" || c.Data == "h3" || c.Data == "a" || c.Data == "ul" || c.Data == "ol" || c.Data == "form" || c.Data == "li" || c.Data == "strong" || c.Data == "b" || c.Data == "img") {
+					if c.Type == NodeElement && (c.Tag == "p" || c.Tag == "div" || c.Tag == "h1" || c.Tag == "h2" || c.Tag == "h3" || c.Tag == "a" || c.Tag == "ul" || c.Tag == "ol" || c.Tag == "form" || c.Tag == "li" || c.Tag == "strong" || c.Tag == "b" || c.Tag == "img") {
 						hasBlockChild = true
 						break
 					}
 				}
 				if !hasBlockChild {
-					txt := strings.TrimSpace(nodeText(n))
+					txt := strings.TrimSpace(n.TextContent())
 					if txt != "" {
 						elems = append(elems, &PageElement{
 							Type:  TypeText,
 							Text:  txt,
-							Style: nodeStyleAttr(n),
+							Style: getElementStyleProps(n),
 						})
 						return
 					}
@@ -1009,8 +1043,8 @@ func parseHTML(r io.Reader) (string, []*PageElement) {
 		}
 	}
 
-	walk(doc)
-	return title, elems
+	walk(root)
+	return elems
 }
 
 func nodeText(n *html.Node) string {
@@ -1220,6 +1254,44 @@ func (b *BrowserApp) layoutContent(gtx layout.Context) layout.Dimensions {
 		b.mu.Unlock()
 		return layout.Dimensions{}
 	}
+	layoutRoot := tab.LayoutRoot
+	currentURL := tab.CurrentURL
+	b.mu.Unlock()
+
+	// If we have an active layout tree from E3, use the single-pass PaintLayout engine (E4)
+	if layoutRoot != nil {
+		availWidth := float32(gtx.Constraints.Max.X)
+		if availWidth > 0 {
+			ComputeLayout(layoutRoot, availWidth)
+		}
+
+		pc := &PaintContext{
+			Theme:    b.theme,
+			ScrollY:  tab.ScrollY,
+			BaseURL:  currentURL,
+			GetImage: b.getImage,
+			Links:    tab.Links,
+		}
+
+		totalH, clickedHref := PaintLayout(gtx, layoutRoot, pc)
+
+		// Handle link clicked from layout tree
+		if clickedHref != "" {
+			target := resolveURL(currentURL, clickedHref)
+			b.urlEditor.SetText(target)
+			go b.fetchURL(tab, target, true, b.window)
+		}
+
+		tab.MaxScrollY = totalH - float32(gtx.Constraints.Max.Y)
+		if tab.MaxScrollY < 0 {
+			tab.MaxScrollY = 0
+		}
+
+		return layout.Dimensions{Size: gtx.Constraints.Max}
+	}
+
+	// Fallback to basic list view (e.g. for initial / error state without tree)
+	b.mu.Lock()
 	elems := tab.PageElements
 	b.mu.Unlock()
 
