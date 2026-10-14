@@ -69,9 +69,13 @@ func TestParseHTMLAdvanced(t *testing.T) {
 }
 
 func TestBookmarkToggle(t *testing.T) {
+	tab := &Tab{
+		CurrentURL: "https://news.ycombinator.com",
+		Title:      "Hacker News",
+	}
 	app := &BrowserApp{
-		currentURL: "https://news.ycombinator.com",
-		pageTitle:  "Hacker News",
+		tabs:      []*Tab{tab},
+		activeTab: 0,
 	}
 
 	if app.isCurrentBookmarked() {
@@ -86,5 +90,44 @@ func TestBookmarkToggle(t *testing.T) {
 	app.toggleBookmark()
 	if app.isCurrentBookmarked() {
 		t.Errorf("expected not bookmarked after second toggle")
+	}
+}
+
+func TestMultiTabManagement(t *testing.T) {
+	app := &BrowserApp{}
+	t1 := app.newTab("https://www.google.com")
+	t2 := app.newTab("https://go.dev")
+	app.tabs = []*Tab{t1, t2}
+	app.activeTab = 0
+
+	if len(app.tabs) != 2 {
+		t.Fatalf("expected 2 tabs, got %d", len(app.tabs))
+	}
+	if app.getActiveTab().CurrentURL != "https://www.google.com" {
+		t.Errorf("expected active tab 0")
+	}
+
+	// Switch tab
+	app.activeTab = 1
+	if app.getActiveTab().CurrentURL != "https://go.dev" {
+		t.Errorf("expected active tab 1")
+	}
+
+	// Close tab 1
+	app.closeTab(1)
+	if len(app.tabs) != 1 {
+		t.Fatalf("expected 1 tab remaining, got %d", len(app.tabs))
+	}
+	if app.getActiveTab().CurrentURL != "https://www.google.com" {
+		t.Errorf("expected remaining tab to be google.com")
+	}
+
+	// Close last remaining tab: should reset to default instead of empty slice
+	app.closeTab(0)
+	if len(app.tabs) != 1 {
+		t.Fatalf("closing last tab should keep 1 reset tab, got %d", len(app.tabs))
+	}
+	if app.getActiveTab().CurrentURL != defaultHomeURL {
+		t.Errorf("expected reset tab to point to defaultHomeURL")
 	}
 }

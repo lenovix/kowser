@@ -6,7 +6,7 @@ Daftar fitur browser Kowser yang sudah di-develop dan yang masih dalam antrean (
 
 ### 1. Window & UI Dasar (Gio UI)
 - Desktop window murni Go via Gio UI (`gioui.org`), tanpa dependensi CGO.
-- Layout responsif: Top Bar (Address bar & Navigasi), Bookmark Bar, Status Bar, Content Viewport.
+- Layout responsif: Tab Bar, Top Bar (Address bar & Navigasi), Bookmark Bar, Status Bar, Content Viewport.
 
 ### 2. Address Bar & Navigasi Manual
 - Input teks URL dengan event enter (`SubmitEvent`) dan tombol `Go`.
@@ -18,7 +18,7 @@ Daftar fitur browser Kowser yang sudah di-develop dan yang masih dalam antrean (
 - URL resolution otomatis via `url.ResolveReference` (mendukung relative path seperti `/search` ke domain aktif).
 
 ### 4. History (Back & Forward)
-- Manajemen tumpukan riwayat penelusuran (`history []string`, `historyIdx int`).
+- Manajemen tumpukan riwayat penelusuran (`history []string`, `historyIdx int`) terisolasi per tab.
 - Tombol navigasi `<` (Back) dan `>` (Forward) yang sinkron dengan URL aktif dan address bar.
 
 ### 5. Tipografi Dasar Konten
@@ -30,7 +30,7 @@ Daftar fitur browser Kowser yang sudah di-develop dan yang masih dalam antrean (
 
 ### 7. Network & Stability (M4)
 - HTTP client dengan timeout 15 detik (`http.Client{Timeout: 15 * time.Second}`).
-- Cancelable fetch via `context.WithTimeout` + `context.CancelFunc` untuk mencegah race condition saat navigasi cepat.
+- Cancelable fetch via `context.WithTimeout` + `context.CancelFunc` per tab untuk mencegah race condition saat navigasi cepat.
 - Error page element (`TypeError`) yang menampilkan pesan error di viewport jika fetch gagal.
 - Sinkronisasi `currentURL` dari `resp.Request.URL` (handle redirect otomatis).
 
@@ -68,10 +68,18 @@ Daftar fitur browser Kowser yang sudah di-develop dan yang masih dalam antrean (
 - Persistent bookmark disimpan dan dimuat dari file `bookmarks.json`.
 - Bookmark Bar horizontal yang menampilkan daftar link favorit tepat di bawah address bar untuk navigasi langsung.
 
+### 13. Multi-Tab Support (M9)
+- Komponen Tab Bar horizontal di bagian paling atas aplikasi dengan tombol tambah tab (`+`).
+- Setiap tab memiliki state terisolasi penuh: URL aktif, riwayat navigasi (history stack & index), elemen halaman (`PageElements`), status loading/error, dan context cancellation.
+- Kemampuan berpindah antar tab (klik judul tab) secara instan.
+- Judul tab dinamis yang mencerminkan judul halaman atau URL aktif (dengan pemotongan panjang teks agar rapi).
+- Tombol tutup tab individual (`x`).
+- Perlindungan tab terakhir: jika tab terakhir ditutup, browser tidak crash melainkan otomatis me-reset tab menjadi "New Tab" ke `google.com`.
+
 ---
 
 ## Roadmap Fitur Berikutnya (Sesuai `tasks.md`)
 
-- [ ] **M9: Multi-Tab Support** (Tab bar horizontal, state navigasi terisolasi per tab).
-- [ ] **M7: CSS Parser Dasar** (Parsing style inline dan selektor dasar warna/margin).
-- [ ] **M11: Download Manager** (Deteksi header Content-Disposition / file biner, simpan file ke folder Downloads).
+- [ ] **M7: CSS Parser Dasar** (Parsing inline stylesheet dan atribut `style`, warna dan font custom).
+- [ ] **M11: File Download Handler** (Deteksi file non-HTML, simpan stream ke folder Downloads pengguna).
+- [ ] **M12: Zoom Controls & Text Resizing** (Zoom in/out skala tampilan konten halaman).

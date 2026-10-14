@@ -61,14 +61,30 @@ type PageElement struct {
 }
 
 type BookmarkItem struct {
-	Title string `json:"title"`
-	URL   string `json:"url"`
+	Title string           `json:"title"`
+	URL   string           `json:"url"`
 	Click widget.Clickable `json:"-"`
 }
 
 type HistoryState struct {
 	History []string `json:"history"`
 	Index   int      `json:"index"`
+}
+
+type Tab struct {
+	ID           int
+	Title        string
+	CurrentURL   string
+	History      []string
+	HistoryIdx   int
+	PageElements []*PageElement
+	StatusText   string
+	Loading      bool
+	CancelFetch  context.CancelFunc
+	ContentList  widget.List
+
+	TabBtn   widget.Clickable
+	CloseBtn widget.Clickable
 }
 
 type BrowserApp struct {
@@ -80,24 +96,21 @@ type BrowserApp struct {
 	reloadBtn   widget.Clickable
 	homeBtn     widget.Clickable
 	bookmarkBtn widget.Clickable
+	newTabBtn   widget.Clickable
+
+	tabBar      widget.List
 	bookmarkBar widget.List
-	contentList widget.List
 
 	client *http.Client
 
-	mu           sync.Mutex
-	statusText   string
-	pageTitle    string
-	currentURL   string
-	history      []string
-	historyIdx   int
-	pageElements []*PageElement
-	loading      bool
-	cancelFetch  context.CancelFunc
-	imgCacheMu   sync.Mutex
-	imgCache     map[string]image.Image
-	window       *app.Window
-	bookmarks    []*BookmarkItem
+	mu         sync.Mutex
+	tabs       []*Tab
+	activeTab  int
+	nextTabID  int
+	imgCacheMu sync.Mutex
+	imgCache   map[string]image.Image
+	window     *app.Window
+	bookmarks  []*BookmarkItem
 }
 
 const defaultHomeURL = "https://www.google.com"
@@ -109,25 +122,31 @@ func historyFilePath() string {
 func (b *BrowserApp) loadHistory() {
 	data, err := os.ReadFile(historyFilePath())
 	if err != nil {
-		b.historyIdx = -1
 		return
 	}
 	var state HistoryState
 	if err := json.Unmarshal(data, &state); err == nil && len(state.History) > 0 {
-		b.history = state.History
-		b.historyIdx = state.Index
-		if b.historyIdx < 0 || b.historyIdx >= len(b.history) {
-			b.historyIdx = len(b.history) - 1
+		idx := state.Index
+		if idx < 0 || idx >= len(state.History) {
+			idx = len(state.History) - 1
 		}
-	} else {
-		b.historyIdx = -1
+		if len(b.tabs) > 0 {
+			b.tabs[0].History = state.History
+			b.tabs[0].HistoryIdx = idx
+			b.tabs[0].CurrentURL = state.History[idx]
+			b.tabs[0].Title = state.History[idx]
+		}
 	}
 }
 
 func (b *BrowserApp) saveHistory() {
+	tab := b.getActiveTab()
+	if tab == nil {
+		return
+	}
 	state := HistoryState{
-		History: b.history,
-		Index:   b.historyIdx,
+		History: tab.History,
+		Index:   tab.HistoryIdx,
 	}
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err == nil {
@@ -165,8 +184,12 @@ func (b *BrowserApp) saveBookmarks() {
 }
 
 func (b *BrowserApp) isCurrentBookmarked() bool {
+	tab := b.getActiveTab()
+	if tab == nil || tab.CurrentURL == "" {
+		return false
+	}
 	for _, bm := range b.bookmarks {
-		if bm.URL == b.currentURL {
+		if bm.URL == tab.CurrentURL {
 			return true
 		}
 	}
@@ -174,23 +197,24 @@ func (b *BrowserApp) isCurrentBookmarked() bool {
 }
 
 func (b *BrowserApp) toggleBookmark() {
-	if b.currentURL == "" {
+	tab := b.getActiveTab()
+	if tab == nil || tab.CurrentURL == "" {
 		return
 	}
 	for i, bm := range b.bookmarks {
-		if bm.URL == b.currentURL {
+		if bm.URL == tab.CurrentURL {
 			b.bookmarks = append(b.bookmarks[:i], b.bookmarks[i+1:]...)
 			b.saveBookmarks()
 			return
 		}
 	}
-	title := b.pageTitle
+	title := tab.Title
 	if title == "" {
-		title = b.currentURL
+		title = tab.CurrentURL
 	}
 	b.bookmarks = append(b.bookmarks, &BookmarkItem{
 		Title: title,
-		URL:   b.currentURL,
+		URL:   tab.CurrentURL,
 	})
 	b.saveBookmarks()
 }
@@ -248,6 +272,66 @@ func (b *BrowserApp) fetchImageAsync(rawURL string) {
 	}()
 }
 
+func (b *BrowserApp) newTab(initialURL string) *Tab {
+	b.nextTabID++
+	tab := &Tab{
+		ID:         b.nextTabID,
+		Title:      "New Tab",
+		CurrentURL: initialURL,
+		HistoryIdx: -1,
+		StatusText: "Ready.",
+		ContentList: widget.List{
+			List: layout.List{
+				Axis: layout.Vertical,
+			},
+		},
+	}
+	return tab
+}
+
+func (b *BrowserApp) getActiveTab() *Tab {
+	if len(b.tabs) == 0 {
+		return nil
+	}
+	if b.activeTab < 0 || b.activeTab >= len(b.tabs) {
+		b.activeTab = 0
+	}
+	return b.tabs[b.activeTab]
+}
+
+func (b *BrowserApp) closeTab(idx int) {
+	if len(b.tabs) <= 1 {
+		// Jangan tutup jika sisa 1 tab, reset ke default
+		tab := b.tabs[0]
+		if tab.CancelFetch != nil {
+			tab.CancelFetch()
+		}
+		tab.Title = "New Tab"
+		tab.CurrentURL = defaultHomeURL
+		tab.History = nil
+		tab.HistoryIdx = -1
+		tab.PageElements = nil
+		tab.StatusText = "Ready."
+		b.urlEditor.SetText(defaultHomeURL)
+		return
+	}
+
+	target := b.tabs[idx]
+	if target.CancelFetch != nil {
+		target.CancelFetch()
+	}
+
+	b.tabs = append(b.tabs[:idx], b.tabs[idx+1:]...)
+	if b.activeTab >= len(b.tabs) {
+		b.activeTab = len(b.tabs) - 1
+	}
+
+	curr := b.getActiveTab()
+	if curr != nil {
+		b.urlEditor.SetText(curr.CurrentURL)
+	}
+}
+
 func main() {
 	jar, _ := cookiejar.New(nil)
 	b := &BrowserApp{
@@ -256,9 +340,9 @@ func main() {
 			Jar:     jar,
 			Timeout: 15 * time.Second,
 		},
-		contentList: widget.List{
+		tabBar: widget.List{
 			List: layout.List{
-				Axis: layout.Vertical,
+				Axis: layout.Horizontal,
 			},
 		},
 		bookmarkBar: widget.List{
@@ -266,17 +350,19 @@ func main() {
 				Axis: layout.Horizontal,
 			},
 		},
-		imgCache:   make(map[string]image.Image),
-		statusText: "Ready. Enter URL or search.",
-		pageTitle:  "Go Browser",
+		imgCache: make(map[string]image.Image),
 	}
+
+	initialTab := b.newTab(defaultHomeURL)
+	b.tabs = append(b.tabs, initialTab)
+	b.activeTab = 0
 
 	b.loadHistory()
 	b.loadBookmarks()
 
 	initialURL := defaultHomeURL
-	if b.historyIdx >= 0 && b.historyIdx < len(b.history) {
-		initialURL = b.history[b.historyIdx]
+	if initialTab.CurrentURL != "" {
+		initialURL = initialTab.CurrentURL
 	}
 
 	b.urlEditor.SingleLine = true
@@ -288,7 +374,7 @@ func main() {
 		b.mu.Lock()
 		b.window = w
 		b.mu.Unlock()
-		w.Option(app.Title(b.pageTitle), app.Size(unit.Dp(900), unit.Dp(650)))
+		w.Option(app.Title("Go Browser"), app.Size(unit.Dp(960), unit.Dp(680)))
 		var ops op.Ops
 		for {
 			switch e := w.Event().(type) {
@@ -310,17 +396,49 @@ func main() {
 
 func (b *BrowserApp) handleEvents(gtx layout.Context, w *app.Window) {
 	b.mu.Lock()
-	canBack := b.historyIdx > 0
-	canFwd := b.historyIdx < len(b.history)-1
-	curr := b.currentURL
-	b.mu.Unlock()
+	defer b.mu.Unlock()
+
+	// Handle new tab button
+	if b.newTabBtn.Clicked(gtx) {
+		t := b.newTab(defaultHomeURL)
+		b.tabs = append(b.tabs, t)
+		b.activeTab = len(b.tabs) - 1
+		b.urlEditor.SetText(defaultHomeURL)
+		go b.fetchURL(t, defaultHomeURL, true, w)
+		return
+	}
+
+	// Handle tab switching & tab closing
+	for i, t := range b.tabs {
+		if t.CloseBtn.Clicked(gtx) {
+			b.closeTab(i)
+			w.Invalidate()
+			return
+		}
+		if t.TabBtn.Clicked(gtx) {
+			b.activeTab = i
+			b.urlEditor.SetText(t.CurrentURL)
+			w.Option(app.Title(t.Title))
+			w.Invalidate()
+			return
+		}
+	}
+
+	active := b.getActiveTab()
+	if active == nil {
+		return
+	}
+
+	canBack := active.HistoryIdx > 0
+	canFwd := active.HistoryIdx < len(active.History)-1
+	curr := active.CurrentURL
 
 	if canBack && b.backBtn.Clicked(gtx) {
-		b.navigateHistory(-1, w)
+		b.navigateHistory(active, -1, w)
 		return
 	}
 	if canFwd && b.fwdBtn.Clicked(gtx) {
-		b.navigateHistory(1, w)
+		b.navigateHistory(active, 1, w)
 		return
 	}
 	if b.reloadBtn.Clicked(gtx) {
@@ -330,34 +448,31 @@ func (b *BrowserApp) handleEvents(gtx layout.Context, w *app.Window) {
 		}
 		if target != "" {
 			target = normalizeURL(target)
-			go b.fetchURL(target, false, w)
+			go b.fetchURL(active, target, false, w)
 		}
 		return
 	}
 	if b.homeBtn.Clicked(gtx) {
 		b.urlEditor.SetText(defaultHomeURL)
-		go b.fetchURL(defaultHomeURL, true, w)
+		go b.fetchURL(active, defaultHomeURL, true, w)
 		return
 	}
 	if b.bookmarkBtn.Clicked(gtx) {
-		b.mu.Lock()
 		b.toggleBookmark()
-		b.mu.Unlock()
 		w.Invalidate()
 		return
 	}
 
-	b.mu.Lock()
-	bms := b.bookmarks
-	b.mu.Unlock()
-	for _, bm := range bms {
+	// Handle bookmarks bar clicks
+	for _, bm := range b.bookmarks {
 		if bm.Click.Clicked(gtx) {
 			b.urlEditor.SetText(bm.URL)
-			go b.fetchURL(bm.URL, true, w)
+			go b.fetchURL(active, bm.URL, true, w)
 			return
 		}
 	}
 
+	// Handle address bar submit
 	submit := false
 	if ev, ok := b.urlEditor.Update(gtx); ok {
 		if _, isSubmit := ev.(widget.SubmitEvent); isSubmit {
@@ -370,20 +485,18 @@ func (b *BrowserApp) handleEvents(gtx layout.Context, w *app.Window) {
 		if target != "" {
 			target = normalizeURL(target)
 			b.urlEditor.SetText(target)
-			go b.fetchURL(target, true, w)
+			go b.fetchURL(active, target, true, w)
 		}
 		return
 	}
 
-	b.mu.Lock()
-	elems := b.pageElements
-	b.mu.Unlock()
-
+	// Handle elements click in current active tab
+	elems := active.PageElements
 	for _, elem := range elems {
 		if elem.Type == TypeLink && elem.Click.Clicked(gtx) {
 			target := resolveURL(curr, elem.Href)
 			b.urlEditor.SetText(target)
-			go b.fetchURL(target, true, w)
+			go b.fetchURL(active, target, true, w)
 			break
 		}
 		if elem.Type == TypeForm && elem.Form != nil {
@@ -408,7 +521,7 @@ func (b *BrowserApp) handleEvents(gtx layout.Context, w *app.Window) {
 					u.RawQuery = q.Encode()
 					target := u.String()
 					b.urlEditor.SetText(target)
-					go b.fetchURL(target, true, w)
+					go b.fetchURL(active, target, true, w)
 					break
 				}
 			}
@@ -435,44 +548,43 @@ func resolveURL(baseRaw, refRaw string) string {
 	return base.ResolveReference(ref).String()
 }
 
-func (b *BrowserApp) navigateHistory(delta int, w *app.Window) {
-	b.mu.Lock()
-	newIdx := b.historyIdx + delta
-	if newIdx < 0 || newIdx >= len(b.history) {
-		b.mu.Unlock()
+func (b *BrowserApp) navigateHistory(tab *Tab, delta int, w *app.Window) {
+	newIdx := tab.HistoryIdx + delta
+	if newIdx < 0 || newIdx >= len(tab.History) {
 		return
 	}
-	b.historyIdx = newIdx
-	target := b.history[b.historyIdx]
+	tab.HistoryIdx = newIdx
+	target := tab.History[tab.HistoryIdx]
 	b.saveHistory()
-	b.mu.Unlock()
 
-	b.urlEditor.SetText(target)
-	go b.fetchURL(target, false, w)
+	if b.getActiveTab() == tab {
+		b.urlEditor.SetText(target)
+	}
+	go b.fetchURL(tab, target, false, w)
 }
 
-func (b *BrowserApp) fetchURL(rawURL string, recordHistory bool, w *app.Window) {
+func (b *BrowserApp) fetchURL(tab *Tab, rawURL string, recordHistory bool, w *app.Window) {
 	b.mu.Lock()
-	if b.cancelFetch != nil {
-		b.cancelFetch()
+	if tab.CancelFetch != nil {
+		tab.CancelFetch()
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	b.cancelFetch = cancel
-	b.loading = true
-	b.statusText = "Loading: " + rawURL
-	b.pageElements = nil
+	tab.CancelFetch = cancel
+	tab.Loading = true
+	tab.StatusText = "Loading: " + rawURL
+	tab.PageElements = nil
 	b.mu.Unlock()
 	w.Invalidate()
 
 	parsedURL, err := url.ParseRequestURI(rawURL)
 	if err != nil {
-		b.setErrorState("Invalid URL: "+err.Error(), rawURL, w)
+		b.setErrorState(tab, "Invalid URL: "+err.Error(), rawURL, w)
 		return
 	}
 
 	req, err := http.NewRequestWithContext(ctx, "GET", parsedURL.String(), nil)
 	if err != nil {
-		b.setErrorState("Request error: "+err.Error(), rawURL, w)
+		b.setErrorState(tab, "Request error: "+err.Error(), rawURL, w)
 		return
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Kowser/1.0")
@@ -480,9 +592,9 @@ func (b *BrowserApp) fetchURL(rawURL string, recordHistory bool, w *app.Window) 
 	resp, err := b.client.Do(req)
 	if err != nil {
 		if ctx.Err() == context.Canceled {
-			return // Superseded by new request
+			return
 		}
-		b.setErrorState("Fetch failed: "+err.Error(), rawURL, w)
+		b.setErrorState(tab, "Fetch failed: "+err.Error(), rawURL, w)
 		return
 	}
 	defer resp.Body.Close()
@@ -498,36 +610,39 @@ func (b *BrowserApp) fetchURL(rawURL string, recordHistory bool, w *app.Window) 
 
 	b.mu.Lock()
 	finalURL := resp.Request.URL.String()
-	b.currentURL = finalURL
-	b.loading = false
+	tab.CurrentURL = finalURL
+	tab.Loading = false
 	if title == "" {
 		title = finalURL
 	}
-	b.pageTitle = title
-	b.statusText = fmt.Sprintf("HTTP %d %s | %d elements", resp.StatusCode, resp.Status, len(elems))
-	b.pageElements = elems
+	tab.Title = title
+	tab.StatusText = fmt.Sprintf("HTTP %d %s | %d elements", resp.StatusCode, resp.Status, len(elems))
+	tab.PageElements = elems
 
 	if recordHistory {
-		if b.historyIdx >= 0 && b.historyIdx < len(b.history) {
-			b.history = append(b.history[:b.historyIdx+1], finalURL)
+		if tab.HistoryIdx >= 0 && tab.HistoryIdx < len(tab.History) {
+			tab.History = append(tab.History[:tab.HistoryIdx+1], finalURL)
 		} else {
-			b.history = append(b.history, finalURL)
+			tab.History = append(tab.History, finalURL)
 		}
-		b.historyIdx = len(b.history) - 1
+		tab.HistoryIdx = len(tab.History) - 1
 		b.saveHistory()
 	}
+	isActive := (b.getActiveTab() == tab)
 	b.mu.Unlock()
 
-	w.Option(app.Title(title))
-	b.urlEditor.SetText(finalURL)
+	if isActive {
+		w.Option(app.Title(title))
+		b.urlEditor.SetText(finalURL)
+	}
 	w.Invalidate()
 }
 
-func (b *BrowserApp) setErrorState(msg string, targetURL string, w *app.Window) {
+func (b *BrowserApp) setErrorState(tab *Tab, msg string, targetURL string, w *app.Window) {
 	b.mu.Lock()
-	b.loading = false
-	b.statusText = msg
-	b.pageElements = []*PageElement{
+	tab.Loading = false
+	tab.StatusText = msg
+	tab.PageElements = []*PageElement{
 		{
 			Type:  TypeError,
 			Text:  "Failed to load page: " + targetURL,
@@ -603,7 +718,6 @@ func parseHTML(r io.Reader) (string, []*PageElement) {
 					Type: TypeForm,
 					Form: form,
 				})
-				// Continue inside form so inner text or links also render
 			case "h1", "h2", "h3", "h4", "h5", "h6":
 				level := int(n.Data[1] - '0')
 				txt := strings.TrimSpace(nodeText(n))
@@ -703,6 +817,9 @@ func nodeText(n *html.Node) string {
 func (b *BrowserApp) layout(gtx layout.Context) layout.Dimensions {
 	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			return b.layoutTabBar(gtx)
+		}),
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 			return b.layoutTopBar(gtx)
 		}),
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
@@ -715,6 +832,73 @@ func (b *BrowserApp) layout(gtx layout.Context) layout.Dimensions {
 			return b.layoutContent(gtx)
 		}),
 	)
+}
+
+func (b *BrowserApp) layoutTabBar(gtx layout.Context) layout.Dimensions {
+	b.mu.Lock()
+	tabs := b.tabs
+	activeIdx := b.activeTab
+	b.mu.Unlock()
+
+	activeBg := color.NRGBA{R: 240, G: 240, B: 240, A: 255}
+	inactiveBg := color.NRGBA{R: 215, G: 215, B: 215, A: 255}
+	closeRed := color.NRGBA{R: 200, G: 40, B: 40, A: 255}
+
+	inset := layout.Inset{Top: unit.Dp(4), Bottom: unit.Dp(2), Left: unit.Dp(6), Right: unit.Dp(6)}
+	return inset.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+			layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+				return material.List(b.theme, &b.tabBar).Layout(gtx, len(tabs), func(gtx layout.Context, i int) layout.Dimensions {
+					t := tabs[i]
+					isActive := (i == activeIdx)
+
+					tabInset := layout.Inset{Right: unit.Dp(4)}
+					return tabInset.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+						return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+							layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+								btn := material.Clickable(gtx, &t.TabBtn, func(gtx layout.Context) layout.Dimensions {
+									pad := layout.Inset{Top: unit.Dp(4), Bottom: unit.Dp(4), Left: unit.Dp(8), Right: unit.Dp(4)}
+									return pad.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+										title := t.Title
+										if len(title) > 16 {
+											title = title[:14] + ".."
+										}
+										lbl := material.Caption(b.theme, title)
+										if isActive {
+											lbl.Color = color.NRGBA{R: 0, G: 0, B: 0, A: 255}
+										} else {
+											lbl.Color = color.NRGBA{R: 90, G: 90, B: 90, A: 255}
+										}
+										return lbl.Layout(gtx)
+									})
+								})
+								_ = isActive
+								_ = activeBg
+								_ = inactiveBg
+								return btn
+							}),
+							layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+								cBtn := material.Clickable(gtx, &t.CloseBtn, func(gtx layout.Context) layout.Dimensions {
+									cPad := layout.Inset{Top: unit.Dp(2), Bottom: unit.Dp(2), Left: unit.Dp(2), Right: unit.Dp(6)}
+									return cPad.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+										cLbl := material.Caption(b.theme, "x")
+										cLbl.Color = closeRed
+										return cLbl.Layout(gtx)
+									})
+								})
+								return cBtn
+							}),
+						)
+					})
+				})
+			}),
+			layout.Rigid(layout.Spacer{Width: unit.Dp(6)}.Layout),
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				btn := material.Button(b.theme, &b.newTabBtn, "+")
+				return btn.Layout(gtx)
+			}),
+		)
+	})
 }
 
 func (b *BrowserApp) layoutTopBar(gtx layout.Context) layout.Dimensions {
@@ -760,7 +944,8 @@ func (b *BrowserApp) layoutTopBar(gtx layout.Context) layout.Dimensions {
 			layout.Rigid(layout.Spacer{Width: unit.Dp(8)}.Layout),
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				btnText := "Go"
-				if b.loading {
+				tab := b.getActiveTab()
+				if tab != nil && tab.Loading {
 					btnText = "..."
 				}
 				btn := material.Button(b.theme, &b.goBtn, btnText)
@@ -779,7 +964,7 @@ func (b *BrowserApp) layoutBookmarkBar(gtx layout.Context) layout.Dimensions {
 		return layout.Dimensions{}
 	}
 
-	inset := layout.Inset{Top: unit.Dp(4), Bottom: unit.Dp(4), Left: unit.Dp(8), Right: unit.Dp(8)}
+	inset := layout.Inset{Top: unit.Dp(2), Bottom: unit.Dp(4), Left: unit.Dp(8), Right: unit.Dp(8)}
 	return inset.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 		return material.List(b.theme, &b.bookmarkBar).Layout(gtx, len(bms), func(gtx layout.Context, i int) layout.Dimensions {
 			bm := bms[i]
@@ -800,7 +985,11 @@ func (b *BrowserApp) layoutStatusBar(gtx layout.Context) layout.Dimensions {
 	inset := layout.Inset{Left: unit.Dp(8), Right: unit.Dp(8), Bottom: unit.Dp(4)}
 	return inset.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 		b.mu.Lock()
-		txt := b.statusText
+		tab := b.getActiveTab()
+		txt := ""
+		if tab != nil {
+			txt = tab.StatusText
+		}
 		b.mu.Unlock()
 		lbl := material.Caption(b.theme, txt)
 		return lbl.Layout(gtx)
@@ -809,7 +998,12 @@ func (b *BrowserApp) layoutStatusBar(gtx layout.Context) layout.Dimensions {
 
 func (b *BrowserApp) layoutContent(gtx layout.Context) layout.Dimensions {
 	b.mu.Lock()
-	elems := b.pageElements
+	tab := b.getActiveTab()
+	if tab == nil {
+		b.mu.Unlock()
+		return layout.Dimensions{}
+	}
+	elems := tab.PageElements
 	b.mu.Unlock()
 
 	if len(elems) == 0 {
@@ -822,7 +1016,7 @@ func (b *BrowserApp) layoutContent(gtx layout.Context) layout.Dimensions {
 	blue := color.NRGBA{R: 26, G: 115, B: 232, A: 255}
 	red := color.NRGBA{R: 220, G: 50, B: 50, A: 255}
 
-	return material.List(b.theme, &b.contentList).Layout(gtx, len(elems), func(gtx layout.Context, i int) layout.Dimensions {
+	return material.List(b.theme, &tab.ContentList).Layout(gtx, len(elems), func(gtx layout.Context, i int) layout.Dimensions {
 		elem := elems[i]
 		inset := layout.Inset{Top: unit.Dp(3), Bottom: unit.Dp(3), Left: unit.Dp(12), Right: unit.Dp(12)}
 
@@ -855,7 +1049,6 @@ func (b *BrowserApp) layoutContent(gtx layout.Context) layout.Dimensions {
 						Fit:      widget.ScaleDown,
 						Position: layout.NW,
 					}
-					// Limit constraints for images
 					origConstraints := gtx.Constraints
 					gtx.Constraints.Max.Y = gtx.Dp(unit.Dp(240))
 					gtx.Constraints.Max.X = gtx.Dp(unit.Dp(360))
@@ -863,7 +1056,6 @@ func (b *BrowserApp) layoutContent(gtx layout.Context) layout.Dimensions {
 					gtx.Constraints = origConstraints
 					return dims
 				}
-				// While loading or failed, show subtle placeholder/alt text
 				alt := elem.Text
 				if alt == "" {
 					alt = "[Image]"
